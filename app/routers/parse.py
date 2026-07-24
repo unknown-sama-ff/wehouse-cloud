@@ -3,6 +3,11 @@
 - 本地端如果配置了 use_cloud_parser=true，会通过此接口把 raw_text 发上来解析
 - 避免把 Moonshot API Key 保存在本地电脑
 - Moonshot 参数从环境变量读取：LLM_API_URL / LLM_API_KEY / LLM_MODEL
+
+【容错原则】
+- /api/parse 接口永远不会 502 / 500（除了鉴权失败 401 / 参数校验失败 422）
+- LLM_API_KEY 是占位符 / 调 Moonshot 连续 3 次失败 → 自动降级到本地正则 _mock_parse()
+- 正则也失败的极端情况 → 返回空字段（area=None…）但 HTTP 200
 """
 
 import json
@@ -22,9 +27,40 @@ router = APIRouter(prefix="/api", tags=["parse"])
 
 logger = logging.getLogger(__name__)
 
-LLM_API_URL = os.getenv("LLM_API_URL", "https://api.moonshot.cn/v1/chat/completions").strip()
-LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
-LLM_MODEL = os.getenv("LLM_MODEL", "kimi-latest").strip()
+LLM_API_URL = (os.getenv("LLM_API_URL") or "https://api.moonshot.cn/v1/chat/completions").strip()
+LLM_API_KEY = (os.getenv("LLM_API_KEY") or "").strip()
+LLM_MODEL = (os.getenv("LLM_MODEL") or "kimi-latest").strip()
+
+# 占位符判断：出现这些都认为是没填真 Key，直接降级正则，不请求外网（避免请求失败浪费时间+502）
+_PLACEHOLDER_MARKERS = (
+    "",
+    "sk-xxx",
+    "sk-xxxx",
+    "sk-xxxxx",
+    "sk-placeholder",
+    "sk-your",
+    "your-",
+    "your-key",
+    "your_api_key",
+    "xxx",
+    "xxxx",
+    "xxxxx",
+    "test",
+    "demo",
+    "none",
+    "null",
+)
+
+
+def _is_placeholder_key(k: str) -> bool:
+    if not k:
+        return True
+    low = k.strip().lower()
+    for p in _PLACEHOLDER_MARKERS:
+        if low == p.lower() or low.startswith(p.lower()):
+            return True
+    return False
+
 
 SYSTEM_PROMPT = (
     "你是一个房产信息提取助手。"
@@ -61,7 +97,7 @@ class ParseResponse(BaseModel):
 
 
 def _mock_parse(message_text: str) -> ParseResponse:
-    """和本地端一致的离线正则解析，作为无 Key 时的兜底"""
+    """和本地端一致的离线正则解析，作为无 Key / LLM 失败时兜底"""
     text = message_text.strip()
 
     def find(patterns):
@@ -154,9 +190,17 @@ def _from_llm_json(data: dict[str, Any]) -> ParseResponse:
 
 
 def _call_llm(message_text: str) -> ParseResponse:
-    """调用 Moonshot 并做 3 次指数退避重试"""
-    if not LLM_API_KEY or LLM_API_KEY == "sk-xxx" or LLM_API_KEY.startswith("your-"):
-        logger.warning("LLM_API_KEY 未配置（或是占位符），自动降级为本地正则解析")
+    """
+    调用 Moonshot 并做 3 次指数退避重试
+    ⚠️  永远不抛异常！失败一律降级到 _mock_parse()，保证接口 HTTP 200
+    """
+    # 占位符 Key → 不请求外网，直接正则
+    if _is_placeholder_key(LLM_API_KEY):
+        logger.warning(
+            "LLM_API_KEY 看起来是占位符(长度=%d, 前缀=%s)，直接降级本地正则解析",
+            len(LLM_API_KEY),
+            (LLM_API_KEY[:10] + "...") if len(LLM_API_KEY) > 10 else LLM_API_KEY,
+        )
         return _mock_parse(message_text)
 
     payload = {
@@ -168,7 +212,6 @@ def _call_llm(message_text: str) -> ParseResponse:
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
-    last_exc: Optional[Exception] = None
     for attempt in range(1, 4):
         try:
             resp = requests.post(
@@ -178,8 +221,16 @@ def _call_llm(message_text: str) -> ParseResponse:
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=90,
+                timeout=45,
             )
+            # 401/403 = Key 无效 / 欠费 → 直接降级不再重试
+            if resp.status_code in (401, 403):
+                logger.warning(
+                    "LLM 返回 %s，认为凭据无效，不再重试，降级到本地正则。响应片段: %s",
+                    resp.status_code,
+                    resp.text[:150],
+                )
+                return _mock_parse(message_text)
             resp.raise_for_status()
             data = resp.json()
             choices = data.get("choices") or []
@@ -189,13 +240,18 @@ def _call_llm(message_text: str) -> ParseResponse:
             parsed = _extract_json_from_text(content)
             return _from_llm_json(parsed)
         except (requests.RequestException, ValueError) as e:
-            last_exc = e
             if attempt >= 3:
-                break
+                logger.warning(
+                    "云端 LLM 解析连续 %d 次失败，最终降级到本地正则: %s",
+                    attempt,
+                    str(e)[:200],
+                )
+                return _mock_parse(message_text)
             delay = 1.0 * (2 ** (attempt - 1))
-            logger.warning("云端 LLM 第 %d/3 次失败: %s, %.1fs 后重试", attempt, e, delay)
+            logger.warning("云端 LLM 第 %d/3 次失败: %s, %.1fs 后重试", attempt, str(e)[:150], delay)
             time.sleep(delay)
-    raise RuntimeError(f"云端 LLM 解析失败: {last_exc}")
+    # 理论上走不到这里，保险兜底
+    return _mock_parse(message_text)
 
 
 @router.post(
@@ -207,16 +263,19 @@ def parse_house_text(req: ParseRequest) -> ParseResponse:
     """
     云端侧解析房产文本（需要写 Token 鉴权）。
 
-    本地采集端可选择把 raw_text 直接发上来，云端用 Railway Variables 里的
-    LLM_API_KEY 调用 Moonshot，避免本地电脑保存任何密钥。
+    永远返回 HTTP 200（除 401 鉴权失败 / 422 参数错误外）：
+      - 有有效 LLM_API_KEY → 调 Moonshot
+      - Key 是占位符 / 调 Moonshot 3 次失败 → 降级本地正则
     """
+    raw = (req.raw_text or "").strip()
+    if not raw:
+        return ParseResponse()
     try:
-        result = _call_llm(req.raw_text)
-        logger.info("云端解析完成: %s", result.model_dump())
-        return result
+        return _call_llm(raw)
     except Exception as e:
-        logger.exception("云端解析异常: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM 解析失败: {e}",
-        )
+        # 终极兜底：任何意料之外的异常都返回正则解析结果（再不济返回全 None）
+        logger.exception("parse 接口终极兜底捕获异常，降级正则解析: %s", e)
+        try:
+            return _mock_parse(raw)
+        except Exception:
+            return ParseResponse()
