@@ -1,0 +1,10 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+# 具体启动哪个角色通过 Variables 里的 SERVICE_ROLE + 覆盖 Start Command 控制
+# 推荐拆两个服务：一个 SERVICE_ROLE=api，一个 SERVICE_ROLE=ui
+# 每个服务单独 Generate Domain，分别得到 API_ENDPOINT 和 UI_ENDPOINT
+restartPolicyType = "ON_FAILURE"
+# API 服务健康检查 /health；UI 服务不需要
+healthcheckPath = "/health"
