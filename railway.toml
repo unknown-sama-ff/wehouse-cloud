@@ -6,5 +6,7 @@ builder = "DOCKERFILE"
 # 推荐拆两个服务：一个 SERVICE_ROLE=api，一个 SERVICE_ROLE=ui
 # 每个服务单独 Generate Domain，分别得到 API_ENDPOINT 和 UI_ENDPOINT
 restartPolicyType = "ON_FAILURE"
-# API 服务健康检查 /health；UI 服务不需要
-healthcheckPath = "/health"
+# 注意：不再设置全局 healthcheckPath
+# - API 服务：如果想启用，在该服务 Settings -> Healthcheck Path 手动填 /health
+# - UI 服务：没有 /health，不要设置 Healthcheck（否则会失败）
+# 默认不设置全局 healthcheck，对新手更友好（防止 SERVICE_ROLE=ui 时健康检查直接超时）
