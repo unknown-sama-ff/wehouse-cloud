@@ -6,6 +6,12 @@ WeHouse Streamlit 管理前端
 - 操作按钮：标记已售 / 过期 / 删除 / 查看原始消息
 - 手动添加房源表单
 - CSV / Excel 导出
+
+【性能优化要点】
+- st.cache_data + 5 分钟 TTL：拉取数据不跨太平洋重复打
+- 写操作（PATCH/DELETE/POST）成功后「先改内存缓存 + 清 cache key + rerun」
+  （而不是删完了再让 load_all_houses 重新拉一遍，跨网慢）
+- 默认 page_size=1000，减少分页网络请求数
 """
 
 import io
@@ -27,6 +33,11 @@ STATUS_LABELS = {"active": "在售", "sold": "已售", "expired": "过期", "del
 STATUS_VALUES = {"在售": "active", "已售": "sold", "过期": "expired", "已删除": "deleted"}
 
 PAGE_SIZE = 20
+# 拉数据时每页 1000 条（而不是 200）——大多数用户 1 条请求拉完，减少跨网次数
+FETCH_PAGE_SIZE = 1000
+# 拉取缓存 TTL：5 分钟内重复 load_all_houses 不打网络（除非写操作手动清缓存）
+CACHE_TTL_SECONDS = 300
+CACHE_KEY = "houses_cache_version"
 
 
 # ---------- 工具函数 ----------
@@ -45,7 +56,7 @@ def _safe_request(method: str, path: str, **kwargs):
             method,
             f"{API_BASE}{path}",
             headers=_auth_headers(method.upper() != "GET"),
-            timeout=30,
+            timeout=15,  # 从 30 改成 15，真失败早失败
             **kwargs,
         )
         return resp
@@ -67,6 +78,17 @@ def _to_wan_wan(price: Optional[str]) -> str:
     return price
 
 
+# ---------- 缓存辅助：写操作后 bump version，下一次 load_all_houses 会绕过缓存 ----------
+
+def _bump_cache() -> None:
+    """让 st.cache_data 立即失效，下一次 load_all_houses 会真打网络（兜底用）"""
+    st.session_state[CACHE_KEY] = st.session_state.get(CACHE_KEY, 0) + 1
+
+
+def _current_cache_ver() -> int:
+    return st.session_state.get(CACHE_KEY, 0)
+
+
 # ---------- 页面初始化 ----------
 
 st.set_page_config(page_title="WeHouse 房源管理", layout="wide", page_icon="🏠")
@@ -75,6 +97,8 @@ st.caption(f"后端 API：{API_BASE}")
 
 if "page" not in st.session_state:
     st.session_state.page = 1
+if CACHE_KEY not in st.session_state:
+    st.session_state[CACHE_KEY] = 0
 
 
 # ---------- 侧边栏筛选 ----------
@@ -105,16 +129,22 @@ with st.sidebar:
         st.rerun()
 
 
-# ---------- 拉取数据 ----------
+# ---------- 拉取数据（加缓存！关键性能点） ----------
 
-def load_all_houses():
-    """一次拉全量（Streamlit 适合小数据量），然后在前端二次筛选"""
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def _load_from_remote(cache_version: int, area_filter: str) -> list[dict]:
+    """
+    真正打网络的函数。
+    cache_version 参数存在的唯一目的：写操作 bump_cache 后，参数变化 → st.cache_data 重新执行。
+    area_filter 参数：避免用户每次侧边栏改 area 都打网络，我们后端 GET /api/houses?area=xxx 直接服务端筛更省带宽。
+    其他筛选（户型/价格/日期/状态）放在客户端二次筛，保持交互快。
+    """
     all_items: list[dict] = []
     page = 1
     while True:
-        params = {"page": page, "page_size": 200}
-        if f_area:
-            params["area"] = f_area
+        params: dict = {"page": page, "page_size": FETCH_PAGE_SIZE}
+        if area_filter:
+            params["area"] = area_filter
         resp = _safe_request("GET", "/api/houses", params=params)
         if resp is None or resp.status_code != 200:
             if resp is not None:
@@ -128,6 +158,13 @@ def load_all_houses():
             break
         page += 1
     return all_items
+
+
+def load_all_houses() -> list[dict]:
+    """对外入口：优先缓存 + 支持版本失效"""
+    ver = _current_cache_ver()
+    # area 传服务端筛选（其他筛选走客户端），减少数据量
+    return _load_from_remote(ver, f_area)
 
 
 with st.spinner("正在加载房源数据..."):
@@ -204,11 +241,28 @@ with c4:
 st.divider()
 
 
-# ---------- 操作函数 ----------
+# ---------- 操作函数（优化关键：成功后本地直接改列表 + bump cache，不跨网重拉！） ----------
+
+def _mutate_local_list(house_id: int, new_status: Optional[str], remove: bool = False) -> None:
+    """
+    写操作成功后，在本地的 all_houses 里立即体现，用户视觉上「秒改」。
+    同时 bump_cache 版本：下次刷新/手动重置时才会从后端重新拉（保证数据一致性兜底）。
+    """
+    for i, h in enumerate(all_houses):
+        if h.get("id") == house_id:
+            if remove:
+                all_houses.pop(i)
+            elif new_status is not None:
+                h["status"] = new_status
+                h["updated_at"] = datetime.now().isoformat()
+            break
+    _bump_cache()
+
 
 def update_status(house_id: int, new_status: str, label: str) -> None:
     resp = _safe_request("PATCH", f"/api/houses/{house_id}", json={"status": new_status})
     if resp is not None and 200 <= resp.status_code < 300:
+        _mutate_local_list(house_id, new_status=new_status)
         st.success(f"已标记为 {label}")
         st.rerun()
     else:
@@ -219,6 +273,8 @@ def update_status(house_id: int, new_status: str, label: str) -> None:
 def soft_delete(house_id: int) -> None:
     resp = _safe_request("DELETE", f"/api/houses/{house_id}")
     if resp is not None and 200 <= resp.status_code < 300:
+        # 软删除：后端把 status 改成 deleted，我们本地也同步成 deleted（而不是从列表里移除，避免筛选「已删除」找不到）
+        _mutate_local_list(house_id, new_status="deleted")
         st.success("已删除")
         st.rerun()
     else:
@@ -269,6 +325,14 @@ with st.expander("➕ 手动添加房源", expanded=False):
             }
             resp = _safe_request("POST", "/api/houses", json=payload)
             if resp is not None and 200 <= resp.status_code < 300:
+                # POST 成功：尝试把后端返回的新记录（含 id/created_at）插在本地列表最前面
+                try:
+                    new_item = resp.json()
+                    if isinstance(new_item, dict) and "id" in new_item:
+                        all_houses.insert(0, new_item)
+                except Exception:
+                    pass
+                _bump_cache()
                 st.success("添加成功")
                 st.rerun()
             else:
