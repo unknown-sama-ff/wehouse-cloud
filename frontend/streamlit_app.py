@@ -415,30 +415,50 @@ else:
         with st.container(border=True):
             hc1, hc2 = st.columns([12, 1])
             with hc1:
+                # 标题：小区名优先；没识别到就拿 raw_text 前 30 个字当标题（再也不显示(未识别小区)了）
+                raw = (h.get("raw_text") or "").strip()
+                first_line = raw.splitlines()[0].strip()[:30] if raw else ""
+                area_title = (h.get("area") or "").strip()
+                if not area_title or area_title in ("（未识别小区）", "(未识别小区)", "（待手动解析）", "(待手动解析)"):
+                    area_title = first_line or "（点击下方原始消息查看）"
                 title_parts = [
                     badge_color,
-                    f"**{h.get('area') or '（未识别小区）'}**",
-                    h.get("layout") or "",
-                    h.get("size") or "",
+                    f"**{area_title}**",
                 ]
+                if h.get("layout"):
+                    title_parts.append(f"户型 {h.get('layout')}")
+                if h.get("size"):
+                    title_parts.append(str(h.get("size")))
                 st.markdown(" &nbsp;·&nbsp; ".join([p for p in title_parts if p]))
                 meta_cols = st.columns(4)
                 with meta_cols[0]:
-                    st.metric("总价", _to_wan_wan(h.get("price")))
+                    price_val = _to_wan_wan(h.get("price"))
+                    st.metric("总价/租金", price_val if price_val else "见原文")
                 with meta_cols[1]:
-                    st.metric("面积", h.get("size") or "-")
+                    st.metric("面积", h.get("size") or "见原文")
                 with meta_cols[2]:
-                    st.metric("楼层", h.get("floor") or "-")
+                    st.metric("楼层", h.get("floor") or "见原文")
                 with meta_cols[3]:
                     st.metric("状态", label)
+                # ---- 新增：卡片直接展示原始消息（不需要点按钮！解析全空也能看到完整原文 ----
+                st.divider()
+                if raw:
+                    with st.container(border=False, height=None):
+                        # 如果解析字段全空，标黄提示用户看原文
+                        parsed_any = any([h.get("area"), h.get("size"), h.get("price"), h.get("layout"), h.get("floor"), h.get("contact")])
+                        pre = "📝 原始消息（解析字段识别不到时请看这里）：" if not parsed_any else "📝 原始消息："
+                        st.caption(pre)
+                        st.text(raw[:600] if len(raw) > 600 else raw)
+                        if len(raw) > 600:
+                            st.caption(f"（共 {len(raw)} 字，完整内容点右上角 📝 查看）")
                 st.caption(
                     f"来源：{h.get('source') or '-'} ｜ "
                     f"联系人：{h.get('contact') or '-'} ｜ "
                     f"接收时间：{h.get('created_at') or '-'}"
                 )
             with hc2:
-                if st.button("📝", key=f"raw_{h['id']}", help="查看原始消息"):
-                    with st.expander(f"原始消息 #{h['id']}", expanded=True):
+                if st.button("📝", key=f"raw_{h['id']}", help="查看完整原始消息"):
+                    with st.expander(f"完整原始消息 #{h['id']}", expanded=True):
                         st.text(h.get("raw_text") or "(空)")
 
             bc1, bc2, bc3, bc4 = st.columns([2, 2, 2, 2])
