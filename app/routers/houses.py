@@ -104,7 +104,7 @@ def list_houses(
     sort: str = Query("created_at", description="排序字段"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
-    page_size: int = Query(20, ge=1, le=500, description="每页条数"),
+    page_size: int = Query(20, ge=1, le=5000, description="每页条数（最大 5000，避免拉全表 OOM）"),
     db: Session = Depends(get_db),
 ) -> schemas.HouseListResponse:
     """

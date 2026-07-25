@@ -33,8 +33,9 @@ STATUS_LABELS = {"active": "在售", "sold": "已售", "expired": "过期", "del
 STATUS_VALUES = {"在售": "active", "已售": "sold", "过期": "expired", "已删除": "deleted"}
 
 PAGE_SIZE = 20
-# 拉数据时每页 1000 条（而不是 200）——大多数用户 1 条请求拉完，减少跨网次数
-FETCH_PAGE_SIZE = 1000
+# 拉数据时每页 500 条（兼顾单次拉取量 & 后端 page_size le=5000 上限；配合 cache 基本够用）
+# 如果你房源超过 5000 条，会自动按 FETCH_PAGE_SIZE 继续翻页，不用改这里
+FETCH_PAGE_SIZE = 500
 # 拉取缓存 TTL：5 分钟内重复 load_all_houses 不打网络（除非写操作手动清缓存）
 CACHE_TTL_SECONDS = 300
 CACHE_KEY = "houses_cache_version"
